@@ -1,0 +1,156 @@
+name: Build Taskcard Downloader
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Install Playwright browsers
+      run: |
+        playwright install chromium
+
+    - name: Build macOS app
+      run: |
+        pyinstaller --clean taskcard_downloader.spec
+
+        # Copy Chromium browser into app
+        mkdir -p "dist/TaskcardDownloader.app/Contents/Resources/playwright_browsers"
+        CHROMIUM_PATH=$(find ~/.cache/ms-playwright -name "chromium-*" -type d | head -n 1)
+        cp -R "$CHROMIUM_PATH" "dist/TaskcardDownloader.app/Contents/Resources/playwright_browsers/"
+
+    - name: Create DMG (optional)
+      run: |
+        # Install create-dmg if you want a DMG file
+        # brew install create-dmg
+        # create-dmg dist/TaskcardDownloader.app
+
+        # For now, just create a zip
+        cd dist
+        zip -r TaskcardDownloader-macOS.zip TaskcardDownloader.app
+
+    - name: Upload macOS artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: TaskcardDownloader-macOS
+        path: dist/TaskcardDownloader-macOS.zip
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Install Playwright browsers
+      run: |
+        playwright install chromium
+
+    - name: Build Windows app
+      run: |
+        pyinstaller --clean taskcard_downloader_windows.spec
+
+    - name: Copy Chromium browser
+      shell: powershell
+      run: |
+        $chromiumPath = Get-ChildItem "$env:LOCALAPPDATA\ms-playwright" -Filter "chromium-*" -Directory | Select-Object -First 1
+
+        if ($chromiumPath) {
+          New-Item -ItemType Directory -Force -Path "dist\TaskcardDownloader\playwright_browsers"
+          Copy-Item -Recurse "$($chromiumPath.FullName)" "dist\TaskcardDownloader\playwright_browsers\$($chromiumPath.Name)"
+          Write-Host "Chromium copied successfully!"
+        } else {
+          Write-Error "Chromium not found!"
+          exit 1
+        }
+
+    - name: Create Windows archive
+      shell: powershell
+      run: |
+        Compress-Archive -Path "dist\TaskcardDownloader" -DestinationPath "TaskcardDownloader-Windows.zip"
+
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: TaskcardDownloader-Windows
+        path: TaskcardDownloader-Windows.zip
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+    - name: Download macOS artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: TaskcardDownloader-macOS
+
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: TaskcardDownloader-Windows
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          TaskcardDownloader-macOS.zip
+          TaskcardDownloader-Windows.zip
+        body: |
+          ## Taskcard Downloader Release
+
+          ### Downloads
+          - **macOS**: TaskcardDownloader-macOS.zip (~560 MB)
+          - **Windows**: TaskcardDownloader-Windows.zip (~560 MB)
+
+          ### Installation
+
+          **macOS:**
+          1. Download und entpacken
+          2. Rechtsklick → "Öffnen" (Sicherheitswarnung umgehen)
+          3. Fertig!
+
+          **Windows:**
+          1. Download und entpacken
+          2. TaskcardDownloader.exe starten
+          3. Bei SmartScreen-Warnung: "Weitere Informationen" → "Trotzdem ausführen"
+
+          ### Features
+          - Vollständiger Download von Taskcard-Boards als PDF
+          - Integration aller PDF-Anhänge
+          - Keine Installation nötig (Stand-alone)
+          - Chromium Browser bereits enthalten
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
