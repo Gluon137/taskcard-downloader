@@ -222,6 +222,20 @@ class TaskcardDownloaderGUI:
 
         self.setup_ui()
 
+    def _bind_entry_shortcuts(self, entry):
+        """Bind keyboard shortcuts for Entry widget to fix PyInstaller/macOS issues"""
+        # macOS Command key bindings
+        entry.bind('<Command-a>', lambda e: entry.select_range(0, tk.END) or 'break')
+        entry.bind('<Command-c>', lambda e: self.root.clipboard_clear() or self.root.clipboard_append(entry.selection_get()) or 'break')
+        entry.bind('<Command-x>', lambda e: (self.root.clipboard_clear(), self.root.clipboard_append(entry.selection_get()), entry.delete(tk.SEL_FIRST, tk.SEL_LAST)) if entry.selection_present() else None)
+        entry.bind('<Command-v>', lambda e: entry.insert(tk.INSERT, self.root.clipboard_get()) or 'break')
+
+        # Also bind Control key as fallback
+        entry.bind('<Control-a>', lambda e: entry.select_range(0, tk.END) or 'break')
+        entry.bind('<Control-c>', lambda e: self.root.clipboard_clear() or self.root.clipboard_append(entry.selection_get()) or 'break')
+        entry.bind('<Control-x>', lambda e: (self.root.clipboard_clear(), self.root.clipboard_append(entry.selection_get()), entry.delete(tk.SEL_FIRST, tk.SEL_LAST)) if entry.selection_present() else None)
+        entry.bind('<Control-v>', lambda e: entry.insert(tk.INSERT, self.root.clipboard_get()) or 'break')
+
     def setup_ui(self):
         """Setup the user interface"""
         # Main container with padding
@@ -242,13 +256,21 @@ class TaskcardDownloaderGUI:
 
         # URL Input
         ttk.Label(main_frame, text="Taskcard URL:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        url_entry = ttk.Entry(main_frame, textvariable=self.url_var, width=50)
+        url_entry = tk.Entry(main_frame, textvariable=self.url_var, width=50, font=('Helvetica', 11))
         url_entry.grid(row=1, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        url_entry.config(state='normal')  # Explicitly set to normal state
+        # Enable copy-paste on macOS
+        self._bind_entry_shortcuts(url_entry)
+        self.url_entry = url_entry  # Store reference
 
         # Output file
         ttk.Label(main_frame, text="Ausgabe-Datei:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        output_entry = ttk.Entry(main_frame, textvariable=self.output_var, width=50)
+        output_entry = tk.Entry(main_frame, textvariable=self.output_var, width=50, font=('Helvetica', 11))
         output_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 5))
+        output_entry.config(state='normal')  # Explicitly set to normal state
+        # Enable copy-paste on macOS
+        self._bind_entry_shortcuts(output_entry)
+        self.output_entry = output_entry  # Store reference
 
         browse_button = ttk.Button(main_frame, text="Durchsuchen...", command=self.browse_output)
         browse_button.grid(row=2, column=2, sticky=tk.W, pady=5)
@@ -405,17 +427,41 @@ class TaskcardDownloaderGUI:
             self.log(f"PDF-Anhänge: {'Ja' if include_attachments else 'Nein'}")
             self.log("-" * 70)
 
-            # Create downloader and run
+            # Create downloader with temporary name
             downloader = TaskcardDownloader(url, output_file)
 
             # Redirect output to log
             import io
             import contextlib
+            import re
 
             log_capture = io.StringIO()
 
             # Run async download
             async def download_task():
+                # First fetch the data to get the board title
+                await downloader.fetch_taskcard_data()
+
+                # Update output filename based on board title
+                if downloader.data.get('board_title'):
+                    # Sanitize the board title for use as filename
+                    board_title = downloader.data['board_title']
+                    # Remove invalid filename characters
+                    safe_title = re.sub(r'[<>:"/\\|?*]', '', board_title)
+                    # Limit length to 100 characters
+                    safe_title = safe_title[:100].strip()
+
+                    # Update the output file with the board title
+                    output_path = Path(output_file)
+                    new_filename = f"{safe_title}.pdf"
+                    new_output_file = output_path.parent / new_filename
+                    downloader.output_file = str(new_output_file)
+
+                    # Update the GUI output field
+                    self.root.after(0, self.output_var.set, str(new_output_file))
+                    self.root.after(0, self.log, f"Dateiname angepasst: {new_filename}")
+
+                # Now save the PDF
                 await downloader.download_and_save(include_pdf_attachments=include_attachments)
 
             # Capture output
@@ -428,7 +474,9 @@ class TaskcardDownloaderGUI:
                 if line.strip():
                     self.log(line)
 
-            self.root.after(0, self.download_complete_success, output_file)
+            # Use the actual output file (may have been renamed)
+            final_output = downloader.output_file
+            self.root.after(0, self.download_complete_success, final_output)
 
         except Exception as e:
             error_msg = str(e)

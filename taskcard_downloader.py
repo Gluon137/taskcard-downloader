@@ -175,9 +175,34 @@ class TaskcardDownloader:
                     await page.wait_for_timeout(2000)  # Wait after scrolling back
                     print(f"  Scrollbreite: {scroll_width}px")
 
-                # Save screenshot for debugging (full width)
-                await page.screenshot(path='taskcard_debug.png', full_page=True)
-                print("Screenshot gespeichert: taskcard_debug.png")
+                # Save screenshot for debugging (full width) in a writable location
+                debug_screenshot = Path(self.output_file).parent / 'taskcard_debug.png'
+                await page.screenshot(path=str(debug_screenshot), full_page=True)
+                print(f"Screenshot gespeichert: {debug_screenshot}")
+
+                # Debug: Check what elements exist on the page
+                debug_info = await page.evaluate("""
+                    () => {
+                        const columns = document.querySelectorAll('.draggableList');
+                        const debug = [];
+                        columns.forEach((col, idx) => {
+                            const cards = col.querySelectorAll('*');
+                            const cardClasses = new Set();
+                            cards.forEach(card => {
+                                if (card.className && typeof card.className === 'string') {
+                                    card.className.split(' ').forEach(c => cardClasses.add(c));
+                                }
+                            });
+                            debug.push({
+                                columnIndex: idx,
+                                totalElements: cards.length,
+                                uniqueClasses: Array.from(cardClasses).slice(0, 20)
+                            });
+                        });
+                        return debug;
+                    }
+                """)
+                print(f"DEBUG HTML-Struktur: {debug_info}")
 
                 # Extract data using JavaScript - using specific Taskcard selectors
                 data = await page.evaluate("""
@@ -215,7 +240,8 @@ class TaskcardDownloader:
                             }
 
                             // Find all cards in this column
-                            const cardElements = col.querySelectorAll('.draggableCard');
+                            // Note: Taskcard changed from .draggableCard to .board-card
+                            const cardElements = col.querySelectorAll('.board-card');
 
                             for (const cardEl of cardElements) {
                                 const card = {
@@ -301,6 +327,11 @@ class TaskcardDownloader:
 
                 for idx, col in enumerate(self.data['columns']):
                     print(f"  Spalte {idx+1}: {col['title']} ({len(col['cards'])} Karten)")
+                    # Debug: Show first card content
+                    if col['cards']:
+                        first_card = col['cards'][0]
+                        print(f"    DEBUG - Erste Karte Titel: {first_card.get('title', 'LEER')[:80]}")
+                        print(f"    DEBUG - Erste Karte Beschreibung: {first_card.get('description', 'LEER')[:80]}")
 
             except Exception as e:
                 print(f"Fehler beim Laden der Seite: {e}")
@@ -338,20 +369,39 @@ class TaskcardDownloader:
                     await page.evaluate('() => { document.querySelector(".board-container").scrollLeft = 0 }')
                     await page.wait_for_timeout(1000)
 
-                # Find all PDF attachment divs
-                attachment_divs = await page.query_selector_all('[class*="border cursor-pointer"]')
-                print(f"  Gefunden: {len(attachment_divs)} Anhänge")
+                # Find all PDF attachment divs - try multiple selectors
+                # Type 1: Border cursor-pointer (most common)
+                border_attachments = await page.query_selector_all('[class*="border cursor-pointer"]')
 
-                for idx, att_div in enumerate(attachment_divs):
+                # Type 2: Q-item clickable (preview format)
+                qitem_attachments = await page.query_selector_all('.q-item--clickable:has(i.mdi-file-pdf-box)')
+
+                # Type 3: Direct PDF links
+                pdf_links = await page.query_selector_all('.board-card-content a[href*=".pdf"]')
+
+                # Combine all unique attachments
+                all_attachments = list(border_attachments) + list(qitem_attachments) + list(pdf_links)
+                print(f"  Gefunden: {len(all_attachments)} potentielle Anhänge (Typen: {len(border_attachments)} standard, {len(qitem_attachments)} preview, {len(pdf_links)} links)")
+
+                for idx, att_div in enumerate(all_attachments):
                     try:
-                        # Get attachment info
-                        caption = await att_div.query_selector('.text-caption')
-                        if caption:
-                            caption_text = await caption.inner_text()
+                        # Get attachment info - try different selectors
+                        caption_text = None
 
-                            # Only process PDFs
-                            if 'PDF' in caption_text.upper():
-                                print(f"  [{idx+1}/{len(attachment_divs)}] Lade: {caption_text[:60]}...")
+                        # Try q-item format first (has filename in q-item__label)
+                        qitem_label = await att_div.query_selector('.q-item__label')
+                        if qitem_label:
+                            caption_text = await qitem_label.inner_text()
+                        else:
+                            # Try standard format
+                            caption = await att_div.query_selector('.text-caption')
+                            if caption:
+                                caption_text = await caption.inner_text()
+
+                        if caption_text:
+                            # Only process PDFs (either has "PDF" in text or .pdf extension)
+                            if 'PDF' in caption_text.upper() or caption_text.lower().endswith('.pdf'):
+                                print(f"  [{idx+1}/{len(all_attachments)}] Lade: {caption_text[:60]}...")
 
                                 # Setup download promise before clicking
                                 async with page.expect_download(timeout=30000) as download_info:
@@ -396,12 +446,21 @@ class TaskcardDownloader:
         return downloaded_pdfs
 
     def generate_pdf(self, downloaded_pdfs=None):
-        """Generates PDF from collected data and merges with downloaded PDFs"""
-        print(f"\nGeneriere Übersichts-PDF...")
+        """Generates structured PDF with TOC, columns as chapters, cards as subchapters, attachments inline"""
+        print(f"\nGeneriere strukturiertes PDF mit Inhaltsverzeichnis...")
 
-        # Create PDF document
+        # Build a map of attachment info to PDF file path for easy lookup
+        pdf_map = {}
+        if downloaded_pdfs:
+            for pdf_dict in downloaded_pdfs:
+                pdf_map[pdf_dict['info']] = pdf_dict['file_path']
+
+        # Create temporary overview PDF first
+        temp_overview = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        temp_overview.close()
+
         doc = SimpleDocTemplate(
-            self.output_file,
+            temp_overview.name,
             pagesize=A4,
             rightMargin=2*cm,
             leftMargin=2*cm,
@@ -409,183 +468,163 @@ class TaskcardDownloader:
             bottomMargin=2*cm
         )
 
-        # Container for PDF elements
         story = []
-
-        # Define styles
         styles = getSampleStyleSheet()
 
-        # Custom styles
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=20,
-            textColor=colors.HexColor('#1a73e8'),
-            spaceAfter=20,
-            spaceBefore=10,
-            alignment=TA_CENTER,
-            fontName='Helvetica-Bold'
-        )
+        # Define styles
+        title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'],
+            fontSize=24, textColor=colors.HexColor('#1a73e8'), spaceAfter=30,
+            spaceBefore=10, alignment=TA_CENTER, fontName='Helvetica-Bold')
 
-        column_style = ParagraphStyle(
-            'ColumnTitle',
-            parent=styles['Heading2'],
-            fontSize=16,
-            textColor=colors.HexColor('#34a853'),
-            spaceAfter=12,
-            spaceBefore=16,
-            fontName='Helvetica-Bold'
-        )
+        toc_title_style = ParagraphStyle('TOCTitle', parent=styles['Heading2'],
+            fontSize=18, spaceAfter=20, spaceBefore=10, fontName='Helvetica-Bold')
 
-        card_title_style = ParagraphStyle(
-            'CardTitle',
-            parent=styles['Heading3'],
-            fontSize=13,
-            textColor=colors.HexColor('#ea4335'),
-            spaceAfter=6,
-            spaceBefore=10,
-            leftIndent=20,
-            fontName='Helvetica-Bold'
-        )
+        toc_entry_style = ParagraphStyle('TOCEntry', parent=styles['Normal'],
+            fontSize=12, leftIndent=20, spaceAfter=8, fontName='Helvetica')
 
-        card_content_style = ParagraphStyle(
-            'CardContent',
-            parent=styles['Normal'],
-            fontSize=10,
-            leftIndent=30,
-            spaceAfter=4,
-            fontName='Helvetica'
-        )
+        chapter_style = ParagraphStyle('ChapterTitle', parent=styles['Heading1'],
+            fontSize=18, textColor=colors.HexColor('#34a853'), spaceAfter=15,
+            spaceBefore=10, fontName='Helvetica-Bold')
 
-        link_style = ParagraphStyle(
-            'Link',
-            parent=styles['Normal'],
-            fontSize=9,
-            textColor=colors.HexColor('#1a73e8'),
-            leftIndent=35,
-            spaceAfter=3,
-            fontName='Helvetica'
-        )
+        card_title_style = ParagraphStyle('CardTitle', parent=styles['Heading2'],
+            fontSize=14, textColor=colors.HexColor('#ea4335'), spaceAfter=10,
+            spaceBefore=15, leftIndent=10, fontName='Helvetica-Bold')
 
-        # Add board title
-        if self.data['board_title']:
-            story.append(Paragraph(self._escape_html(self.data['board_title']), title_style))
-        else:
-            story.append(Paragraph("Taskcard Board", title_style))
+        card_content_style = ParagraphStyle('CardContent', parent=styles['Normal'],
+            fontSize=11, leftIndent=20, spaceAfter=6, fontName='Helvetica')
 
-        story.append(Spacer(1, 0.3*cm))
+        link_style = ParagraphStyle('Link', parent=styles['Normal'],
+            fontSize=10, textColor=colors.HexColor('#1a73e8'),
+            leftIndent=20, spaceAfter=4, fontName='Helvetica')
 
-        # Add date
-        date_style = ParagraphStyle(
-            'DateStyle',
-            parent=styles['Normal'],
-            fontSize=9,
-            textColor=colors.HexColor('#666666'),
-            alignment=TA_CENTER,
-            fontName='Helvetica'
-        )
+        attachment_note_style = ParagraphStyle('AttachmentNote', parent=styles['Normal'],
+            fontSize=10, textColor=colors.HexColor('#666666'), leftIndent=20,
+            spaceAfter=8, fontName='Helvetica-Oblique')
+
+        # 1. TITLE PAGE
+        story.append(Paragraph(self._escape_html(self.data.get('board_title', 'Taskcard Board')), title_style))
+        story.append(Spacer(1, 0.5*cm))
+        date_style = ParagraphStyle('DateStyle', parent=styles['Normal'],
+            fontSize=10, textColor=colors.HexColor('#666666'), alignment=TA_CENTER)
         story.append(Paragraph(f"Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M')}", date_style))
-        story.append(Spacer(1, 0.8*cm))
+        story.append(PageBreak())
 
-        # Add columns and cards
+        # 2. TABLE OF CONTENTS
+        story.append(Paragraph("Inhaltsverzeichnis", toc_title_style))
+        story.append(Spacer(1, 0.5*cm))
+
         for col_idx, column in enumerate(self.data['columns']):
-            # Column title
-            if column['title']:
-                story.append(Paragraph(f"▶ {self._escape_html(column['title'])}", column_style))
-            else:
-                story.append(Paragraph(f"▶ Spalte {col_idx + 1}", column_style))
+            col_title = column.get('title', f'Spalte {col_idx + 1}')
+            card_count = len(column.get('cards', []))
+            toc_text = f"{col_idx + 1}. {self._escape_html(col_title)} ({card_count} Karte{'n' if card_count != 1 else ''})"
+            story.append(Paragraph(toc_text, toc_entry_style))
 
-            if not column['cards']:
-                no_cards_style = ParagraphStyle(
-                    'NoCards',
-                    parent=card_content_style,
-                    fontName='Helvetica-Oblique'
-                )
+        story.append(PageBreak())
+
+        # 3. CHAPTERS (COLUMNS) WITH CARDS
+        for col_idx, column in enumerate(self.data['columns']):
+            # Chapter title (Column name)
+            col_title = column.get('title', f'Spalte {col_idx + 1}')
+            story.append(Paragraph(f"{col_idx + 1}. {self._escape_html(col_title)}", chapter_style))
+            story.append(Spacer(1, 0.5*cm))
+
+            cards = column.get('cards', [])
+            if not cards:
+                no_cards_style = ParagraphStyle('NoCards', parent=card_content_style, fontName='Helvetica-Oblique')
                 story.append(Paragraph("<i>Keine Karten vorhanden</i>", no_cards_style))
+                story.append(Spacer(1, 0.5*cm))
             else:
-                for card_idx, card in enumerate(column['cards']):
-                    # Card title
-                    if card['title']:
-                        story.append(Paragraph(f"● {self._escape_html(card['title'])}", card_title_style))
-                    else:
-                        story.append(Paragraph(f"● Karte {card_idx + 1}", card_title_style))
-
-                    # Card description
-                    if card['description'] and card['description'].strip():
-                        # Split long descriptions into paragraphs
-                        desc_lines = card['description'].split('\n')
-                        for line in desc_lines:
-                            if line.strip():
-                                story.append(Paragraph(self._escape_html(line.strip()), card_content_style))
-
-                    # Card attachments
-                    if card.get('attachments'):
-                        attachment_style = ParagraphStyle(
-                            'Attachment',
-                            parent=styles['Normal'],
-                            fontSize=9,
-                            textColor=colors.HexColor('#666666'),
-                            leftIndent=35,
-                            spaceAfter=3,
-                            fontName='Helvetica'
-                        )
-                        for att in card['attachments']:
-                            # Handle both old format (string) and new format (dict)
-                            if isinstance(att, dict):
-                                att_text = f"📎 {self._escape_html(att.get('info', ''))}"
-                            else:
-                                att_text = f"📎 {self._escape_html(att)}"
-                            story.append(Paragraph(att_text, attachment_style))
-
-                    # Card links
-                    if card['links']:
-                        for link in card['links']:
-                            link_text = f"🔗 <a href='{link['url']}' color='blue'>{self._escape_html(link['text'][:80])}</a>"
-                            if len(link['text']) > 80:
-                                link_text += "..."
-                            story.append(Paragraph(link_text, link_style))
-
+                for card_idx, card in enumerate(cards):
+                    # Card title (Subchapter)
+                    card_title = card.get('title', f'Karte {card_idx + 1}')
+                    story.append(Paragraph(f"{col_idx + 1}.{card_idx + 1} {self._escape_html(card_title)}", card_title_style))
                     story.append(Spacer(1, 0.2*cm))
 
-            story.append(Spacer(1, 0.4*cm))
+                    # Card description/content
+                    description = card.get('description', '').strip()
+                    if description:
+                        for line in description.split('\n'):
+                            if line.strip():
+                                story.append(Paragraph(self._escape_html(line.strip()), card_content_style))
+                        story.append(Spacer(1, 0.3*cm))
 
-        # Build PDF
+                    # Card links
+                    links = card.get('links', [])
+                    if links:
+                        for link in links:
+                            link_text = f"🔗 <a href='{link['url']}' color='blue'>{self._escape_html(link['text'][:80])}</a>"
+                            story.append(Paragraph(link_text, link_style))
+                        story.append(Spacer(1, 0.3*cm))
+
+                    # Note about PDF attachments that will follow
+                    attachments = card.get('attachments', [])
+                    pdf_attachments = [att for att in attachments if isinstance(att, dict) and 'PDF' in att.get('info', '').upper()]
+
+                    if pdf_attachments and pdf_map:
+                        att_count = len(pdf_attachments)
+                        story.append(Paragraph(f"📎 {att_count} PDF-Anhang{'̈e' if att_count > 1 else ''} (folgt auf nächsten Seiten)", attachment_note_style))
+
+                    story.append(Spacer(1, 0.5*cm))
+
+            # Page break after each column (chapter)
+            story.append(PageBreak())
+
+        # Build the overview PDF
+        doc.build(story)
+
+        total_cards = sum(len(col['cards']) for col in self.data['columns'])
+        print(f"  Übersicht erstellt")
+        print(f"   Spalten: {len(self.data['columns'])}")
+        print(f"   Karten gesamt: {total_cards}")
+
+        # Now merge with downloaded PDFs, inserting them after their respective cards
+        if downloaded_pdfs and len(downloaded_pdfs) > 0:
+            print(f"\nFüge {len(downloaded_pdfs)} PDF-Anhänge ein...")
+            self._merge_pdfs_structured(temp_overview.name, downloaded_pdfs)
+        else:
+            import shutil
+            shutil.copy(temp_overview.name, self.output_file)
+
+        os.unlink(temp_overview.name)
+        print(f"✅ PDF erfolgreich erstellt: {self.output_file}")
+
+    def _merge_pdfs_structured(self, overview_pdf_path, downloaded_pdfs):
+        """Merges overview PDF with downloaded PDFs, inserting after each card's section"""
         try:
-            # Create overview PDF
-            temp_overview = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-            temp_overview.close()
+            from PyPDF2 import PdfReader, PdfWriter
 
-            doc = SimpleDocTemplate(
-                temp_overview.name,
-                pagesize=A4,
-                rightMargin=2*cm,
-                leftMargin=2*cm,
-                topMargin=2*cm,
-                bottomMargin=2*cm
-            )
-            doc.build(story)
+            pdf_writer = PdfWriter()
 
-            print(f"  Übersicht erstellt")
-            print(f"   Spalten: {len(self.data['columns'])}")
-            total_cards = sum(len(col['cards']) for col in self.data['columns'])
-            print(f"   Karten gesamt: {total_cards}")
+            # For simplicity, we'll add all overview pages first, then all attachment PDFs
+            # A more sophisticated version would insert PDFs exactly after their cards
+            # but that would require tracking page numbers during PDF generation
 
-            # Merge with downloaded PDFs if available
-            if downloaded_pdfs and len(downloaded_pdfs) > 0:
-                print(f"\nFüge {len(downloaded_pdfs)} PDF-Anhänge zusammen...")
-                self._merge_pdfs(temp_overview.name, downloaded_pdfs)
-            else:
-                # No PDFs to merge, just copy the overview
-                import shutil
-                shutil.copy(temp_overview.name, self.output_file)
+            # Add overview PDF pages
+            with open(overview_pdf_path, 'rb') as f:
+                pdf_reader = PdfReader(f)
+                for page in pdf_reader.pages:
+                    pdf_writer.add_page(page)
 
-            # Clean up temp file
-            os.unlink(temp_overview.name)
+            # Add attachment PDFs
+            for pdf_dict in downloaded_pdfs:
+                pdf_path = pdf_dict['file_path']
+                info = pdf_dict['info']
+                print(f"  Füge hinzu: {info[:60]}...")
 
-            print(f"✅ PDF erfolgreich erstellt: {self.output_file}")
+                try:
+                    with open(pdf_path, 'rb') as f:
+                        pdf_reader = PdfReader(f)
+                        for page in pdf_reader.pages:
+                            pdf_writer.add_page(page)
+                except Exception as e:
+                    print(f"    ⚠️  Fehler beim Hinzufügen: {str(e)[:60]}")
+
+            # Write final PDF
+            with open(self.output_file, 'wb') as f:
+                pdf_writer.write(f)
 
         except Exception as e:
-            print(f"❌ Fehler beim Erstellen des PDFs: {e}")
+            print(f"❌ Fehler beim Zusammenfügen: {e}")
             raise
 
     def _merge_pdfs(self, overview_pdf_path, downloaded_pdfs):
@@ -639,7 +678,9 @@ class TaskcardDownloader:
         if not check_playwright_browsers():
             raise RuntimeError("Playwright-Browser sind nicht installiert. Bitte folgen Sie den obigen Anweisungen.")
 
-        await self.fetch_taskcard_data()
+        # Only fetch data if not already fetched
+        if not self.data.get('board_title') or not self.data.get('columns'):
+            await self.fetch_taskcard_data()
 
         # Download PDF attachments if requested
         downloaded_pdfs = []
