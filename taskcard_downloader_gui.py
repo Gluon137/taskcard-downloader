@@ -218,6 +218,7 @@ class TaskcardDownloaderGUI:
         self.url_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.include_attachments_var = tk.BooleanVar(value=True)
+        self.export_json_var = tk.BooleanVar(value=False)
         self.is_downloading = False
 
         self.setup_ui()
@@ -286,6 +287,13 @@ class TaskcardDownloaderGUI:
             variable=self.include_attachments_var
         )
         attachments_check.grid(row=0, column=0, sticky=tk.W)
+
+        json_export_check = ttk.Checkbutton(
+            options_frame,
+            text="Auch als JSON exportieren (für Weiterverarbeitung)",
+            variable=self.export_json_var
+        )
+        json_export_check.grid(row=1, column=0, sticky=tk.W)
 
         # Buttons
         button_frame = ttk.Frame(main_frame)
@@ -420,11 +428,13 @@ class TaskcardDownloaderGUI:
             url = self.url_var.get().strip()
             output_file = self.output_var.get().strip()
             include_attachments = self.include_attachments_var.get()
+            export_json = self.export_json_var.get()
 
             self.log(f"Starte Download...")
             self.log(f"URL: {url}")
             self.log(f"Ausgabe: {output_file}")
             self.log(f"PDF-Anhänge: {'Ja' if include_attachments else 'Nein'}")
+            self.log(f"JSON-Export: {'Ja' if export_json else 'Nein'}")
             self.log("-" * 70)
 
             # Create downloader with temporary name
@@ -461,8 +471,14 @@ class TaskcardDownloaderGUI:
                     self.root.after(0, self.output_var.set, str(new_output_file))
                     self.root.after(0, self.log, f"Dateiname angepasst: {new_filename}")
 
-                # Now save the PDF
-                await downloader.download_and_save(include_pdf_attachments=include_attachments)
+                # Now save the PDF and get downloaded PDFs list
+                downloaded_pdfs = await downloader.download_and_save(include_pdf_attachments=include_attachments)
+
+                # Export JSON if requested
+                if export_json:
+                    json_file = Path(downloader.output_file).with_suffix('.json')
+                    downloader.export_json(str(json_file), downloaded_pdfs=downloaded_pdfs)
+                    self.root.after(0, self.log, f"✅ JSON erfolgreich exportiert: {json_file}")
 
             # Capture output
             with contextlib.redirect_stdout(log_capture), contextlib.redirect_stderr(log_capture):

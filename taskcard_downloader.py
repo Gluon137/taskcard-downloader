@@ -690,6 +690,91 @@ class TaskcardDownloader:
         # Generate final PDF
         self.generate_pdf(downloaded_pdfs)
 
+        # Return downloaded PDFs for JSON export
+        return downloaded_pdfs
+
+    def export_json(self, json_file=None, downloaded_pdfs=None):
+        """Export Taskcard data as JSON
+
+        Args:
+            json_file: Path to output JSON file
+            downloaded_pdfs: List of downloaded PDF file paths (optional)
+        """
+        if json_file is None:
+            json_file = self.output_file.replace('.pdf', '.json')
+
+        # Create a mapping of PDF captions to local file paths
+        pdf_mapping = {}
+        if downloaded_pdfs:
+            for pdf_item in downloaded_pdfs:
+                # downloaded_pdfs is a list of dicts: {'info': caption, 'file_path': path}
+                if isinstance(pdf_item, dict):
+                    info = pdf_item.get('info', '')
+                    file_path = pdf_item.get('file_path', '')
+                    if info and file_path:
+                        pdf_mapping[info] = file_path
+
+        # Prepare data for export
+        export_data = {
+            'board_title': self.data.get('board_title', ''),
+            'export_date': datetime.now().isoformat(),
+            'source_url': self.url,
+            'columns': []
+        }
+
+        # Add all columns and cards
+        for column in self.data.get('columns', []):
+            column_data = {
+                'title': column.get('title', ''),
+                'cards': []
+            }
+
+            for card in column.get('cards', []):
+                card_data = {
+                    'title': card.get('title', ''),
+                    'description': card.get('description', ''),
+                    'attachments': [],
+                    'links': []
+                }
+
+                # Add attachments with local file paths if available
+                for attachment in card.get('attachments', []):
+                    caption = attachment.get('caption', '')
+
+                    # Try to find matching downloaded PDF by caption
+                    local_file = pdf_mapping.get(caption, None)
+
+                    # If not found by exact match, try fuzzy matching
+                    if not local_file:
+                        for pdf_info, pdf_path in pdf_mapping.items():
+                            # Check if caption is contained in PDF info or vice versa
+                            if caption and pdf_info and (caption in pdf_info or pdf_info in caption):
+                                local_file = pdf_path
+                                break
+
+                    card_data['attachments'].append({
+                        'caption': caption,
+                        'local_file': local_file,  # Path to downloaded PDF
+                        'note': 'URLs ändern sich - nutze local_file für Zugriff auf heruntergeladene Datei'
+                    })
+
+                # Add links
+                for link in card.get('links', []):
+                    card_data['links'].append({
+                        'text': link.get('text', ''),
+                        'url': link.get('url', '')
+                    })
+
+                column_data['cards'].append(card_data)
+
+            export_data['columns'].append(column_data)
+
+        # Write JSON file
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+        print(f"✅ JSON erfolgreich exportiert: {json_file}")
+
 
 async def main():
     parser = argparse.ArgumentParser(
