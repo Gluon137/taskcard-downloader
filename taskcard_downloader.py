@@ -752,11 +752,18 @@ class TaskcardDownloader:
                                 local_file = pdf_path
                                 break
 
-                    card_data['attachments'].append({
+                    attachment_data = {
                         'caption': caption,
-                        'local_file': local_file,  # Path to downloaded PDF
-                        'note': 'URLs ändern sich - nutze local_file für Zugriff auf heruntergeladene Datei'
-                    })
+                        'local_file': local_file,  # Path to downloaded PDF (null if not downloaded)
+                    }
+
+                    # Add appropriate note based on whether file was downloaded
+                    if local_file:
+                        attachment_data['note'] = 'Datei wurde heruntergeladen - nutze local_file für Zugriff'
+                    else:
+                        attachment_data['note'] = 'Datei wurde nicht heruntergeladen (PDF-Anhänge Option war deaktiviert oder Download fehlgeschlagen)'
+
+                    card_data['attachments'].append(attachment_data)
 
                 # Add links
                 for link in card.get('links', []):
