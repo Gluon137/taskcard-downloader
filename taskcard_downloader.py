@@ -57,7 +57,7 @@ from playwright.async_api import async_playwright
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as RLImage
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from reportlab.lib import colors
 from datetime import datetime
@@ -248,7 +248,8 @@ class TaskcardDownloader:
                                     title: '',
                                     description: '',
                                     links: [],
-                                    attachments: []
+                                    attachments: [],
+                                    images: []
                                 };
 
                                 // Get card title from board-card-header
@@ -274,6 +275,16 @@ class TaskcardDownloader:
                                         // Avoid duplicate links
                                         if (!card.links.find(l => l.url === href)) {
                                             card.links.push({ text, url: href });
+                                        }
+                                    }
+
+                                    // Get images from card
+                                    const images = cardContent.querySelectorAll('img');
+                                    for (const img of images) {
+                                        const src = img.src;
+                                        const alt = img.alt || 'Bild';
+                                        if (src && src.startsWith('http')) {
+                                            card.images.push({ src, alt });
                                         }
                                     }
 
@@ -306,7 +317,7 @@ class TaskcardDownloader:
                                 }
 
                                 // Only add card if it has content
-                                if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0) {
+                                if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
                                     columnData.cards.push(card);
                                 }
                             }
@@ -326,12 +337,16 @@ class TaskcardDownloader:
                 print(f"Gefundene Spalten: {len(self.data['columns'])}")
 
                 for idx, col in enumerate(self.data['columns']):
-                    print(f"  Spalte {idx+1}: {col['title']} ({len(col['cards'])} Karten)")
+                    # Count images in this column
+                    total_images = sum(len(card.get('images', [])) for card in col['cards'])
+                    print(f"  Spalte {idx+1}: {col['title']} ({len(col['cards'])} Karten, {total_images} Bilder)")
                     # Debug: Show first card content
                     if col['cards']:
                         first_card = col['cards'][0]
                         print(f"    DEBUG - Erste Karte Titel: {first_card.get('title', 'LEER')[:80]}")
                         print(f"    DEBUG - Erste Karte Beschreibung: {first_card.get('description', 'LEER')[:80]}")
+                        if first_card.get('images'):
+                            print(f"    DEBUG - Erste Karte Bilder: {len(first_card['images'])} Bild(er)")
 
             except Exception as e:
                 print(f"Fehler beim Laden der Seite: {e}")
@@ -453,6 +468,81 @@ class TaskcardDownloader:
 
                 print(f"\n  {len(downloaded_pdfs)} Anhänge erfolgreich heruntergeladen")
 
+                # Download images from cards
+                total_images = sum(len(card.get('images', [])) for col in self.data.get('columns', []) for card in col.get('cards', []))
+                print(f"\nLade Bilder aus Karten herunter...")
+                print(f"  Gefunden: {total_images} Bilder")
+                image_count = 0
+                for column in self.data.get('columns', []):
+                    for card in column.get('cards', []):
+                        for image in card.get('images', []):
+                            try:
+                                src = image.get('src')
+                                alt = image.get('alt', 'Bild')
+
+                                if not src:
+                                    continue
+
+                                print(f"  Lade Bild: {alt[:50]}...")
+
+                                # Download image using requests
+                                import requests
+                                response = requests.get(src, timeout=30)
+                                response.raise_for_status()
+
+                                # Determine file extension from content-type or URL
+                                content_type = response.headers.get('content-type', '')
+                                if 'png' in content_type:
+                                    ext = '.png'
+                                elif 'jpeg' in content_type or 'jpg' in content_type:
+                                    ext = '.jpg'
+                                elif 'gif' in content_type:
+                                    ext = '.gif'
+                                elif 'webp' in content_type:
+                                    ext = '.webp'
+                                else:
+                                    # Try to guess from URL
+                                    if src.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                                        ext = src[src.rfind('.'):]
+                                    else:
+                                        ext = '.jpg'  # Default
+
+                                # Sanitize filename
+                                safe_name = "".join(c for c in alt if c.isalnum() or c in (' ', '.', '_', '-')).strip()
+                                if not safe_name:
+                                    safe_name = f"image_{image_count}"
+
+                                # Save image
+                                final_path = attachments_dir / f"{safe_name}{ext}"
+
+                                # Handle duplicates
+                                counter = 1
+                                while final_path.exists():
+                                    final_path = attachments_dir / f"{safe_name}_{counter}{ext}"
+                                    counter += 1
+
+                                with open(final_path, 'wb') as f:
+                                    f.write(response.content)
+
+                                # Add to downloaded_pdfs list with image info
+                                downloaded_pdfs.append({
+                                    'info': f"Bild: {alt}",
+                                    'file_path': str(final_path),
+                                    'type': 'image'
+                                })
+
+                                # Update image reference in card data
+                                image['local_path'] = str(final_path)
+
+                                image_count += 1
+                                print(f"      ✓ {len(response.content) // 1024} KB → {final_path.name}")
+
+                            except Exception as e:
+                                print(f"      ⚠️  Fehler beim Laden des Bildes: {str(e)[:60]}")
+
+                if image_count > 0:
+                    print(f"\n  {image_count} Bilder erfolgreich heruntergeladen")
+
             except Exception as e:
                 print(f"Fehler beim Herunterladen der Anhänge: {e}")
             finally:
@@ -562,6 +652,58 @@ class TaskcardDownloader:
                             if line.strip():
                                 story.append(Paragraph(self._escape_html(line.strip()), card_content_style))
                         story.append(Spacer(1, 0.3*cm))
+
+                    # Card images
+                    images = card.get('images', [])
+                    if images:
+                        for img in images:
+                            local_path = img.get('local_path')
+                            alt = img.get('alt', 'Bild')
+
+                            if local_path and os.path.exists(local_path):
+                                try:
+                                    # Calculate maximum width (PDF page width minus margins)
+                                    max_width = A4[0] - 4*cm  # 2cm left + 2cm right margin
+                                    max_height = 10*cm  # Maximum height to prevent huge images
+
+                                    # Create ReportLab Image object
+                                    img_obj = RLImage(local_path)
+
+                                    # Get original dimensions
+                                    img_width = img_obj.imageWidth
+                                    img_height = img_obj.imageHeight
+
+                                    # Calculate scaling to fit within max dimensions
+                                    width_scale = max_width / img_width
+                                    height_scale = max_height / img_height
+                                    scale = min(width_scale, height_scale, 1.0)  # Don't upscale
+
+                                    # Set final dimensions
+                                    img_obj.drawWidth = img_width * scale
+                                    img_obj.drawHeight = img_height * scale
+
+                                    # Add image to story with alt text caption
+                                    story.append(Spacer(1, 0.2*cm))
+                                    story.append(img_obj)
+
+                                    # Add caption if alt text exists
+                                    if alt and alt != 'Bild':
+                                        caption_style = ParagraphStyle('ImageCaption', parent=card_content_style,
+                                            fontSize=9, textColor=colors.HexColor('#666666'),
+                                            fontName='Helvetica-Oblique', alignment=TA_CENTER)
+                                        story.append(Spacer(1, 0.1*cm))
+                                        story.append(Paragraph(self._escape_html(alt), caption_style))
+
+                                    story.append(Spacer(1, 0.3*cm))
+
+                                except Exception as e:
+                                    print(f"Fehler beim Einfügen von Bild {local_path}: {e}")
+                                    # Add note about missing image
+                                    error_style = ParagraphStyle('ImageError', parent=card_content_style,
+                                        fontSize=9, textColor=colors.HexColor('#ea4335'),
+                                        fontName='Helvetica-Oblique')
+                                    story.append(Paragraph(f"⚠️ Bild konnte nicht eingefügt werden: {alt}", error_style))
+                                    story.append(Spacer(1, 0.2*cm))
 
                     # Card links
                     links = card.get('links', [])
