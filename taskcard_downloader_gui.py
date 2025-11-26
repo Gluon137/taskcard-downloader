@@ -283,7 +283,7 @@ class TaskcardDownloaderGUI:
 
         attachments_check = ttk.Checkbutton(
             options_frame,
-            text="PDF-Anhänge in das finale PDF integrieren (dauert länger, größere Datei)",
+            text="Anhänge herunterladen (PDFs werden ins Haupt-PDF integriert, andere Dateien separat gespeichert)",
             variable=self.include_attachments_var
         )
         attachments_check.grid(row=0, column=0, sticky=tk.W)

@@ -342,9 +342,15 @@ class TaskcardDownloader:
                 await browser.close()
 
     async def download_pdf_attachments_with_playwright(self):
-        """Downloads PDF attachments by clicking download elements with Playwright"""
-        print("\nLade PDF-Anhänge über Browser herunter...")
-        downloaded_pdfs = []
+        """Downloads all file attachments by clicking download elements with Playwright"""
+        print("\nLade Anhänge über Browser herunter...")
+        downloaded_pdfs = []  # Name kept for compatibility, but now handles all file types
+
+        # Create attachments directory next to output PDF
+        output_path = Path(self.output_file)
+        attachments_dir = output_path.parent / f"{output_path.stem}_attachments"
+        attachments_dir.mkdir(exist_ok=True)
+        print(f"Anhänge werden gespeichert in: {attachments_dir}\n")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -369,19 +375,19 @@ class TaskcardDownloader:
                     await page.evaluate('() => { document.querySelector(".board-container").scrollLeft = 0 }')
                     await page.wait_for_timeout(1000)
 
-                # Find all PDF attachment divs - try multiple selectors
+                # Find all file attachment divs - try multiple selectors
                 # Type 1: Border cursor-pointer (most common)
                 border_attachments = await page.query_selector_all('[class*="border cursor-pointer"]')
 
-                # Type 2: Q-item clickable (preview format)
-                qitem_attachments = await page.query_selector_all('.q-item--clickable:has(i.mdi-file-pdf-box)')
+                # Type 2: Q-item clickable (all file types with icons)
+                qitem_attachments = await page.query_selector_all('.q-item--clickable:has(i[class*="mdi-file"])')
 
-                # Type 3: Direct PDF links
-                pdf_links = await page.query_selector_all('.board-card-content a[href*=".pdf"]')
+                # Type 3: Direct file links
+                file_links = await page.query_selector_all('.board-card-content a[href*="download"]')
 
                 # Combine all unique attachments
-                all_attachments = list(border_attachments) + list(qitem_attachments) + list(pdf_links)
-                print(f"  Gefunden: {len(all_attachments)} potentielle Anhänge (Typen: {len(border_attachments)} standard, {len(qitem_attachments)} preview, {len(pdf_links)} links)")
+                all_attachments = list(border_attachments) + list(qitem_attachments) + list(file_links)
+                print(f"  Gefunden: {len(all_attachments)} potentielle Anhänge (Typen: {len(border_attachments)} standard, {len(qitem_attachments)} preview, {len(file_links)} links)")
 
                 for idx, att_div in enumerate(all_attachments):
                     try:
@@ -399,10 +405,9 @@ class TaskcardDownloader:
                                 caption_text = await caption.inner_text()
 
                         if caption_text:
-                            # Only process PDFs (either has "PDF" in text or .pdf extension)
-                            if 'PDF' in caption_text.upper() or caption_text.lower().endswith('.pdf'):
-                                print(f"  [{idx+1}/{len(all_attachments)}] Lade: {caption_text[:60]}...")
+                            print(f"  [{idx+1}/{len(all_attachments)}] Lade: {caption_text[:60]}...")
 
+                            try:
                                 # Setup download promise before clicking
                                 async with page.expect_download(timeout=30000) as download_info:
                                     # Click the attachment to trigger download
@@ -410,33 +415,43 @@ class TaskcardDownloader:
 
                                 download = await download_info.value
 
-                                # Save to temp file
-                                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-                                temp_file.close()
+                                # Get original filename from download
+                                suggested_filename = download.suggested_filename
 
-                                await download.save_as(temp_file.name)
+                                # Sanitize filename
+                                safe_filename = "".join(c for c in suggested_filename if c.isalnum() or c in (' ', '.', '_', '-')).strip()
+                                if not safe_filename:
+                                    safe_filename = f"attachment_{idx}.bin"
 
-                                # Verify it's a PDF
-                                with open(temp_file.name, 'rb') as f:
-                                    first_bytes = f.read(4)
-                                    if first_bytes == b'%PDF':
-                                        file_size = os.path.getsize(temp_file.name)
-                                        downloaded_pdfs.append({
-                                            'info': caption_text,
-                                            'file_path': temp_file.name
-                                        })
-                                        print(f"      ✓ {file_size // 1024} KB heruntergeladen")
-                                    else:
-                                        print(f"      ⚠️  Datei ist kein PDF")
-                                        os.unlink(temp_file.name)
+                                # Save to attachments directory
+                                final_path = attachments_dir / safe_filename
+
+                                # Handle duplicate filenames
+                                counter = 1
+                                while final_path.exists():
+                                    name, ext = os.path.splitext(safe_filename)
+                                    final_path = attachments_dir / f"{name}_{counter}{ext}"
+                                    counter += 1
+
+                                await download.save_as(str(final_path))
+
+                                file_size = os.path.getsize(final_path)
+                                downloaded_pdfs.append({
+                                    'info': caption_text,
+                                    'file_path': str(final_path)
+                                })
+                                print(f"      ✓ {file_size // 1024} KB heruntergeladen → {final_path.name}")
 
                                 # Wait a bit before next download
                                 await page.wait_for_timeout(500)
 
+                            except Exception as download_error:
+                                print(f"      ⚠️  Download-Fehler: {str(download_error)[:80]}")
+
                     except Exception as e:
                         print(f"      ⚠️  Fehler: {str(e)[:80]}")
 
-                print(f"\n  {len(downloaded_pdfs)} PDF-Anhänge erfolgreich heruntergeladen")
+                print(f"\n  {len(downloaded_pdfs)} Anhänge erfolgreich heruntergeladen")
 
             except Exception as e:
                 print(f"Fehler beim Herunterladen der Anhänge: {e}")
