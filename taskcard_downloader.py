@@ -204,15 +204,17 @@ class TaskcardDownloader:
                 """)
                 print(f"DEBUG HTML-Struktur: {debug_info}")
 
-                # Extract data using JavaScript - using specific Taskcard selectors
+                # Extract data using JavaScript - using specific Taskcard selectors with fallback strategies
                 data = await page.evaluate("""
                     () => {
                         const result = {
                             board_title: '',
-                            columns: []
+                            columns: [],
+                            extraction_strategy: '',
+                            debug_info: ''
                         };
 
-                        // Extract board title
+                        // Extract board title with fallbacks
                         const titleContainer = document.querySelector('.board-information-title');
                         if (titleContainer) {
                             result.board_title = titleContainer.innerText.trim();
@@ -220,111 +222,171 @@ class TaskcardDownloader:
                             const headerTitle = document.querySelector('h1, .board-header-container .text-h5');
                             if (headerTitle) {
                                 result.board_title = headerTitle.innerText.trim();
+                            } else {
+                                // Last fallback: document.title
+                                result.board_title = document.title || 'Unbenanntes Board';
                             }
                         }
 
-                        // Find all column containers using Taskcard-specific class
-                        const columns = document.querySelectorAll('.draggableList');
-
-                        // Process each column
-                        for (const col of columns) {
-                            const columnData = {
+                        // Helper function to extract card data
+                        const extractCardData = (cardEl) => {
+                            const card = {
                                 title: '',
-                                cards: []
+                                description: '',
+                                links: [],
+                                attachments: [],
+                                images: []
                             };
 
-                            // Get column title from board-list-header
-                            const colHeaderDiv = col.querySelector('.board-list-header .contenteditable');
-                            if (colHeaderDiv) {
-                                columnData.title = colHeaderDiv.innerText.trim();
+                            // Get card title from board-card-header
+                            const cardHeader = cardEl.querySelector('.board-card-header .contenteditable');
+                            if (cardHeader) {
+                                card.title = cardHeader.innerText.trim();
                             }
 
-                            // Find all cards in this column
-                            // Note: Taskcard changed from .draggableCard to .board-card
-                            const cardElements = col.querySelectorAll('.board-card');
-
-                            for (const cardEl of cardElements) {
-                                const card = {
-                                    title: '',
-                                    description: '',
-                                    links: [],
-                                    attachments: [],
-                                    images: []
-                                };
-
-                                // Get card title from board-card-header
-                                const cardHeader = cardEl.querySelector('.board-card-header .contenteditable');
-                                if (cardHeader) {
-                                    card.title = cardHeader.innerText.trim();
+                            // Get card content from board-card-content
+                            const cardContent = cardEl.querySelector('.board-card-content');
+                            if (cardContent) {
+                                // Get text content (first contenteditable in card content)
+                                const contentText = cardContent.querySelector('.contenteditable');
+                                if (contentText) {
+                                    card.description = contentText.innerText.trim();
                                 }
 
-                                // Get card content from board-card-content
-                                const cardContent = cardEl.querySelector('.board-card-content');
-                                if (cardContent) {
-                                    // Get text content (first contenteditable in card content)
-                                    const contentText = cardContent.querySelector('.contenteditable');
-                                    if (contentText) {
-                                        card.description = contentText.innerText.trim();
+                                // Get links
+                                const links = cardContent.querySelectorAll('a[href]');
+                                for (const link of links) {
+                                    const href = link.href;
+                                    const text = link.innerText.trim() || link.href;
+                                    // Avoid duplicate links
+                                    if (!card.links.find(l => l.url === href)) {
+                                        card.links.push({ text, url: href });
                                     }
+                                }
 
-                                    // Get links
-                                    const links = cardContent.querySelectorAll('a[href]');
-                                    for (const link of links) {
-                                        const href = link.href;
-                                        const text = link.innerText.trim() || link.href;
-                                        // Avoid duplicate links
-                                        if (!card.links.find(l => l.url === href)) {
-                                            card.links.push({ text, url: href });
-                                        }
+                                // Get images from card - normal <img> tags
+                                const images = cardContent.querySelectorAll('img');
+                                for (const img of images) {
+                                    const src = img.src;
+                                    const alt = img.alt || 'Bild';
+                                    if (src && src.startsWith('http')) {
+                                        card.images.push({ src, alt });
                                     }
+                                }
 
-                                    // Get images from card
-                                    const images = cardContent.querySelectorAll('img');
-                                    for (const img of images) {
-                                        const src = img.src;
-                                        const alt = img.alt || 'Bild';
-                                        if (src && src.startsWith('http')) {
-                                            card.images.push({ src, alt });
-                                        }
-                                    }
-
-                                    // Get attachment info (PDFs, files) with download URLs
-                                    const attachmentDivs = cardContent.querySelectorAll('[class*="border cursor-pointer"]');
-                                    for (const attDiv of attachmentDivs) {
-                                        const fileInfo = attDiv.querySelector('.text-caption');
-                                        // Get the background image URL which contains the file URL
-                                        const imgDiv = attDiv.querySelector('.q-img__image');
-                                        let fileUrl = null;
-                                        if (imgDiv) {
-                                            const bgStyle = imgDiv.style.backgroundImage;
-                                            if (bgStyle) {
-                                                // Use a regex that works in JavaScript
-                                                const urlMatch = bgStyle.match(/url\\("(.+?)"\\)/);
-                                                if (urlMatch) {
-                                                    fileUrl = urlMatch[1];
-                                                }
-                                            }
-                                        }
-
-                                        if (fileInfo) {
-                                            const text = fileInfo.innerText.trim();
-                                            card.attachments.push({
-                                                info: text,
-                                                url: fileUrl
+                                // Get background images (Taskcard Preview Style)
+                                const bgImages = cardContent.querySelectorAll('.q-img__image');
+                                for (const div of bgImages) {
+                                    const bgStyle = div.style.backgroundImage;
+                                    if (bgStyle) {
+                                        const urlMatch = bgStyle.match(/url\\("?(.+?)"?\\)/);
+                                        if (urlMatch) {
+                                            card.images.push({
+                                                src: urlMatch[1],
+                                                alt: 'Hintergrundbild'
                                             });
                                         }
                                     }
                                 }
 
-                                // Only add card if it has content
-                                if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
-                                    columnData.cards.push(card);
+                                // Get attachment info (PDFs, files) with download URLs
+                                const attachmentDivs = cardContent.querySelectorAll('[class*="border cursor-pointer"]');
+                                for (const attDiv of attachmentDivs) {
+                                    const fileInfo = attDiv.querySelector('.text-caption');
+                                    // Get the background image URL which contains the file URL
+                                    const imgDiv = attDiv.querySelector('.q-img__image');
+                                    let fileUrl = null;
+                                    if (imgDiv) {
+                                        const bgStyle = imgDiv.style.backgroundImage;
+                                        if (bgStyle) {
+                                            // Use a regex that works in JavaScript
+                                            const urlMatch = bgStyle.match(/url\\("(.+?)"\\)/);
+                                            if (urlMatch) {
+                                                fileUrl = urlMatch[1];
+                                            }
+                                        }
+                                    }
+
+                                    if (fileInfo) {
+                                        const text = fileInfo.innerText.trim();
+                                        card.attachments.push({
+                                            info: text,
+                                            url: fileUrl
+                                        });
+                                    }
                                 }
                             }
 
-                            // Only add column if it has a title or cards
-                            if (columnData.title || columnData.cards.length > 0) {
-                                result.columns.push(columnData);
+                            return card;
+                        };
+
+                        // STRATEGY 1: Column Layout (Kanban)
+                        const columns = document.querySelectorAll('.draggableList');
+
+                        if (columns.length > 0) {
+                            result.extraction_strategy = 'Spalten-Layout (Kanban)';
+                            result.debug_info = `${columns.length} Spalte(n) erkannt`;
+
+                            // Process each column
+                            for (const col of columns) {
+                                const columnData = {
+                                    title: '',
+                                    cards: []
+                                };
+
+                                // Get column title from board-list-header
+                                const colHeaderDiv = col.querySelector('.board-list-header .contenteditable');
+                                if (colHeaderDiv) {
+                                    columnData.title = colHeaderDiv.innerText.trim();
+                                }
+
+                                // Find all cards in this column
+                                const cardElements = col.querySelectorAll('.board-card');
+
+                                for (const cardEl of cardElements) {
+                                    const card = extractCardData(cardEl);
+
+                                    // Only add card if it has content
+                                    if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
+                                        columnData.cards.push(card);
+                                    }
+                                }
+
+                                // Only add column if it has a title or cards
+                                if (columnData.title || columnData.cards.length > 0) {
+                                    result.columns.push(columnData);
+                                }
+                            }
+
+                        // STRATEGY 2: Free Layout (Pinboard/Timeline)
+                        } else {
+                            const allCards = document.querySelectorAll('.board-card');
+
+                            if (allCards.length > 0) {
+                                result.extraction_strategy = 'Freies Layout (Pinnwand/Tafel)';
+                                result.debug_info = `${allCards.length} Karte(n) ohne Spalten gefunden`;
+
+                                // Create a virtual column for all cards
+                                const fallbackColumn = {
+                                    title: 'Alle Inhalte (Freies Layout)',
+                                    cards: []
+                                };
+
+                                for (const cardEl of allCards) {
+                                    const card = extractCardData(cardEl);
+
+                                    // Only add card if it has content
+                                    if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
+                                        fallbackColumn.cards.push(card);
+                                    }
+                                }
+
+                                result.columns.push(fallbackColumn);
+
+                            // STRATEGY 3: Nothing found
+                            } else {
+                                result.extraction_strategy = 'FEHLER: Keine Inhalte erkannt';
+                                result.debug_info = 'Weder Spalten noch Karten gefunden. Möglicherweise hat sich die Taskcard-Struktur geändert.';
                             }
                         }
 
@@ -333,6 +395,16 @@ class TaskcardDownloader:
                 """)
 
                 self.data = data
+
+                # Display extraction strategy
+                strategy = self.data.get('extraction_strategy', 'Unbekannt')
+                debug_info = self.data.get('debug_info', '')
+
+                print(f"\n{'='*60}")
+                print(f"📋 EXTRAKTIONS-STRATEGIE: {strategy}")
+                print(f"ℹ️  {debug_info}")
+                print(f"{'='*60}")
+
                 print(f"\nBoard-Titel: {self.data['board_title']}")
                 print(f"Gefundene Spalten: {len(self.data['columns'])}")
 
@@ -347,6 +419,21 @@ class TaskcardDownloader:
                         print(f"    DEBUG - Erste Karte Beschreibung: {first_card.get('description', 'LEER')[:80]}")
                         if first_card.get('images'):
                             print(f"    DEBUG - Erste Karte Bilder: {len(first_card['images'])} Bild(er)")
+
+                # Check for error strategy and warn user
+                if self.data.get('extraction_strategy', '').startswith('FEHLER'):
+                    print("\n⚠️  WARNUNG: Keine Inhalte gefunden!")
+                    print("    Mögliche Ursachen:")
+                    print("    - Board ist leer")
+                    print("    - Taskcard hat die HTML-Struktur geändert")
+                    print("    - Zugriffsbeschränkungen auf das Board")
+                    print("    - JavaScript wurde nicht vollständig geladen")
+                    print(f"\n    Debug-Screenshot verfügbar: {debug_screenshot}")
+
+                    # Ask user if they want to continue
+                    response = input("\nMöchten Sie trotzdem ein leeres PDF erstellen? (j/n): ")
+                    if response.lower() not in ['j', 'ja', 'y', 'yes']:
+                        raise RuntimeError("Abbruch durch User: Keine Inhalte extrahiert")
 
             except Exception as e:
                 print(f"Fehler beim Laden der Seite: {e}")
@@ -612,6 +699,16 @@ class TaskcardDownloader:
         date_style = ParagraphStyle('DateStyle', parent=styles['Normal'],
             fontSize=10, textColor=colors.HexColor('#666666'), alignment=TA_CENTER)
         story.append(Paragraph(f"Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M')}", date_style))
+
+        # Add extraction strategy info
+        strategy = self.data.get('extraction_strategy', '')
+        if strategy:
+            strategy_style = ParagraphStyle('StrategyStyle', parent=styles['Normal'],
+                fontSize=9, textColor=colors.HexColor('#666666'),
+                alignment=TA_CENTER, fontName='Helvetica-Oblique')
+            story.append(Spacer(1, 0.3*cm))
+            story.append(Paragraph(f"Extrahiert mit: {self._escape_html(strategy)}", strategy_style))
+
         story.append(PageBreak())
 
         # 2. TABLE OF CONTENTS
@@ -876,6 +973,8 @@ class TaskcardDownloader:
             'board_title': self.data.get('board_title', ''),
             'export_date': datetime.now().isoformat(),
             'source_url': self.url,
+            'extraction_strategy': self.data.get('extraction_strategy', 'Unbekannt'),
+            'debug_info': self.data.get('debug_info', ''),
             'columns': []
         }
 
