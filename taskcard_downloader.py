@@ -64,6 +64,8 @@ from datetime import datetime
 import argparse
 import json
 import requests
+import aiohttp
+import asyncio
 from PyPDF2 import PdfReader, PdfWriter
 
 
@@ -105,537 +107,480 @@ class TaskcardDownloader:
             'columns': []
         }
 
-    async def fetch_taskcard_data(self):
-        """Fetches Taskcard data using Playwright with JavaScript evaluation"""
-        print(f"Öffne Taskcard: {self.url}")
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-
-            # Store for downloaded files
-            self.downloaded_files = []
-
-            try:
-                # Navigate to the page
-                await page.goto(self.url, wait_until='networkidle', timeout=30000)
-
-                # Wait for content to load
-                print("Warte auf Seiteninhalt...")
-                await page.wait_for_timeout(5000)
-
-                # Scroll horizontally to load all columns (lazy loading)
-                print("Lade alle Spalten durch Scrollen...")
-                board_container = await page.query_selector('.board-container')
-                if board_container:
-                    # Get the scrollable width
-                    scroll_width = await page.evaluate('''
-                        () => {
-                            const container = document.querySelector('.board-container');
-                            return container ? container.scrollWidth : 0;
-                        }
-                    ''')
-
-                    # Scroll in steps to trigger lazy loading
-                    current_scroll = 0
-                    step = 600  # Scroll 600px at a time (smaller steps for better loading)
-
-                    while current_scroll < scroll_width:
-                        await page.evaluate(f'''
-                            () => {{
-                                const container = document.querySelector('.board-container');
-                                if (container) {{
-                                    container.scrollLeft = {current_scroll};
-                                }}
-                            }}
-                        ''')
-                        await page.wait_for_timeout(800)  # Wait longer for content to load
-                        current_scroll += step
-
-                    # Scroll to the very end
-                    await page.evaluate('''
-                        () => {
-                            const container = document.querySelector('.board-container');
-                            if (container) {
-                                container.scrollLeft = container.scrollWidth;
-                            }
-                        }
-                    ''')
-                    await page.wait_for_timeout(2000)  # Wait at the end
-
-                    # Scroll back to the beginning
-                    await page.evaluate('''
-                        () => {
-                            const container = document.querySelector('.board-container');
-                            if (container) {
-                                container.scrollLeft = 0;
-                            }
-                        }
-                    ''')
-                    await page.wait_for_timeout(2000)  # Wait after scrolling back
-                    print(f"  Scrollbreite: {scroll_width}px")
-
-                # Save screenshot for debugging (full width) in a writable location
-                debug_screenshot = Path(self.output_file).parent / 'taskcard_debug.png'
-                await page.screenshot(path=str(debug_screenshot), full_page=True)
-                print(f"Screenshot gespeichert: {debug_screenshot}")
-
-                # Debug: Check what elements exist on the page
-                debug_info = await page.evaluate("""
-                    () => {
-                        const columns = document.querySelectorAll('.draggableList');
-                        const debug = [];
-                        columns.forEach((col, idx) => {
-                            const cards = col.querySelectorAll('*');
-                            const cardClasses = new Set();
-                            cards.forEach(card => {
-                                if (card.className && typeof card.className === 'string') {
-                                    card.className.split(' ').forEach(c => cardClasses.add(c));
-                                }
-                            });
-                            debug.push({
-                                columnIndex: idx,
-                                totalElements: cards.length,
-                                uniqueClasses: Array.from(cardClasses).slice(0, 20)
-                            });
-                        });
-                        return debug;
-                    }
-                """)
-                print(f"DEBUG HTML-Struktur: {debug_info}")
-
-                # Extract data using JavaScript - using specific Taskcard selectors with fallback strategies
-                data = await page.evaluate("""
-                    () => {
-                        const result = {
-                            board_title: '',
-                            columns: [],
-                            extraction_strategy: '',
-                            debug_info: ''
-                        };
-
-                        // Extract board title with fallbacks
-                        const titleContainer = document.querySelector('.board-information-title');
-                        if (titleContainer) {
-                            result.board_title = titleContainer.innerText.trim();
-                        } else {
-                            const headerTitle = document.querySelector('h1, .board-header-container .text-h5');
-                            if (headerTitle) {
-                                result.board_title = headerTitle.innerText.trim();
-                            } else {
-                                // Last fallback: document.title
-                                result.board_title = document.title || 'Unbenanntes Board';
-                            }
-                        }
-
-                        // Helper function to extract card data
-                        const extractCardData = (cardEl) => {
-                            const card = {
-                                title: '',
-                                description: '',
-                                links: [],
-                                attachments: [],
-                                images: []
-                            };
-
-                            // Get card title from board-card-header
-                            const cardHeader = cardEl.querySelector('.board-card-header .contenteditable');
-                            if (cardHeader) {
-                                card.title = cardHeader.innerText.trim();
-                            }
-
-                            // Get card content from board-card-content
-                            const cardContent = cardEl.querySelector('.board-card-content');
-                            if (cardContent) {
-                                // Get text content (first contenteditable in card content)
-                                const contentText = cardContent.querySelector('.contenteditable');
-                                if (contentText) {
-                                    card.description = contentText.innerText.trim();
-                                }
-
-                                // Get links
-                                const links = cardContent.querySelectorAll('a[href]');
-                                for (const link of links) {
-                                    const href = link.href;
-                                    const text = link.innerText.trim() || link.href;
-                                    // Avoid duplicate links
-                                    if (!card.links.find(l => l.url === href)) {
-                                        card.links.push({ text, url: href });
-                                    }
-                                }
-
-                                // Get images from card - normal <img> tags
-                                const images = cardContent.querySelectorAll('img');
-                                for (const img of images) {
-                                    const src = img.src;
-                                    const alt = img.alt || 'Bild';
-                                    if (src && src.startsWith('http')) {
-                                        card.images.push({ src, alt });
-                                    }
-                                }
-
-                                // Get background images (Taskcard Preview Style)
-                                const bgImages = cardContent.querySelectorAll('.q-img__image');
-                                for (const div of bgImages) {
-                                    const bgStyle = div.style.backgroundImage;
-                                    if (bgStyle) {
-                                        const urlMatch = bgStyle.match(/url\\("?(.+?)"?\\)/);
-                                        if (urlMatch) {
-                                            card.images.push({
-                                                src: urlMatch[1],
-                                                alt: 'Hintergrundbild'
-                                            });
-                                        }
-                                    }
-                                }
-
-                                // Get attachment info (PDFs, files) with download URLs
-                                const attachmentDivs = cardContent.querySelectorAll('[class*="border cursor-pointer"]');
-                                for (const attDiv of attachmentDivs) {
-                                    const fileInfo = attDiv.querySelector('.text-caption');
-                                    // Get the background image URL which contains the file URL
-                                    const imgDiv = attDiv.querySelector('.q-img__image');
-                                    let fileUrl = null;
-                                    if (imgDiv) {
-                                        const bgStyle = imgDiv.style.backgroundImage;
-                                        if (bgStyle) {
-                                            // Use a regex that works in JavaScript
-                                            const urlMatch = bgStyle.match(/url\\("(.+?)"\\)/);
-                                            if (urlMatch) {
-                                                fileUrl = urlMatch[1];
-                                            }
-                                        }
-                                    }
-
-                                    if (fileInfo) {
-                                        const text = fileInfo.innerText.trim();
-                                        card.attachments.push({
-                                            info: text,
-                                            url: fileUrl
-                                        });
-                                    }
-                                }
-                            }
-
-                            return card;
-                        };
-
-                        // STRATEGY 1: Column Layout (Kanban)
-                        const columns = document.querySelectorAll('.draggableList');
-
-                        if (columns.length > 0) {
-                            result.extraction_strategy = 'Spalten-Layout (Kanban)';
-                            result.debug_info = `${columns.length} Spalte(n) erkannt`;
-
-                            // Process each column
-                            for (const col of columns) {
-                                const columnData = {
-                                    title: '',
-                                    cards: []
-                                };
-
-                                // Get column title from board-list-header
-                                const colHeaderDiv = col.querySelector('.board-list-header .contenteditable');
-                                if (colHeaderDiv) {
-                                    columnData.title = colHeaderDiv.innerText.trim();
-                                }
-
-                                // Find all cards in this column
-                                const cardElements = col.querySelectorAll('.board-card');
-
-                                for (const cardEl of cardElements) {
-                                    const card = extractCardData(cardEl);
-
-                                    // Only add card if it has content
-                                    if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
-                                        columnData.cards.push(card);
-                                    }
-                                }
-
-                                // Only add column if it has a title or cards
-                                if (columnData.title || columnData.cards.length > 0) {
-                                    result.columns.push(columnData);
-                                }
-                            }
-
-                        // STRATEGY 2: Free Layout (Pinboard/Timeline)
-                        } else {
-                            const allCards = document.querySelectorAll('.board-card');
-
-                            if (allCards.length > 0) {
-                                result.extraction_strategy = 'Freies Layout (Pinnwand/Tafel)';
-                                result.debug_info = `${allCards.length} Karte(n) ohne Spalten gefunden`;
-
-                                // Create a virtual column for all cards
-                                const fallbackColumn = {
-                                    title: 'Alle Inhalte (Freies Layout)',
-                                    cards: []
-                                };
-
-                                for (const cardEl of allCards) {
-                                    const card = extractCardData(cardEl);
-
-                                    // Only add card if it has content
-                                    if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
-                                        fallbackColumn.cards.push(card);
-                                    }
-                                }
-
-                                result.columns.push(fallbackColumn);
-
-                            // STRATEGY 3: Nothing found
-                            } else {
-                                result.extraction_strategy = 'FEHLER: Keine Inhalte erkannt';
-                                result.debug_info = 'Weder Spalten noch Karten gefunden. Möglicherweise hat sich die Taskcard-Struktur geändert.';
-                            }
-                        }
-
-                        return result;
-                    }
-                """)
-
-                self.data = data
-
-                # Display extraction strategy
-                strategy = self.data.get('extraction_strategy', 'Unbekannt')
-                debug_info = self.data.get('debug_info', '')
-
-                print(f"\n{'='*60}")
-                print(f"📋 EXTRAKTIONS-STRATEGIE: {strategy}")
-                print(f"ℹ️  {debug_info}")
-                print(f"{'='*60}")
-
-                print(f"\nBoard-Titel: {self.data['board_title']}")
-                print(f"Gefundene Spalten: {len(self.data['columns'])}")
-
-                for idx, col in enumerate(self.data['columns']):
-                    # Count images in this column
-                    total_images = sum(len(card.get('images', [])) for card in col['cards'])
-                    print(f"  Spalte {idx+1}: {col['title']} ({len(col['cards'])} Karten, {total_images} Bilder)")
-                    # Debug: Show first card content
-                    if col['cards']:
-                        first_card = col['cards'][0]
-                        print(f"    DEBUG - Erste Karte Titel: {first_card.get('title', 'LEER')[:80]}")
-                        print(f"    DEBUG - Erste Karte Beschreibung: {first_card.get('description', 'LEER')[:80]}")
-                        if first_card.get('images'):
-                            print(f"    DEBUG - Erste Karte Bilder: {len(first_card['images'])} Bild(er)")
-
-                # Check for error strategy and warn user
-                if self.data.get('extraction_strategy', '').startswith('FEHLER'):
-                    print("\n⚠️  WARNUNG: Keine Inhalte gefunden!")
-                    print("    Mögliche Ursachen:")
-                    print("    - Board ist leer")
-                    print("    - Taskcard hat die HTML-Struktur geändert")
-                    print("    - Zugriffsbeschränkungen auf das Board")
-                    print("    - JavaScript wurde nicht vollständig geladen")
-                    print(f"\n    Debug-Screenshot verfügbar: {debug_screenshot}")
-
-                    # Ask user if they want to continue
-                    response = input("\nMöchten Sie trotzdem ein leeres PDF erstellen? (j/n): ")
-                    if response.lower() not in ['j', 'ja', 'y', 'yes']:
-                        raise RuntimeError("Abbruch durch User: Keine Inhalte extrahiert")
-
-            except Exception as e:
-                print(f"Fehler beim Laden der Seite: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-            finally:
-                await browser.close()
-
-    async def download_pdf_attachments_with_playwright(self):
-        """Downloads all file attachments by clicking download elements with Playwright"""
-        print("\nLade Anhänge über Browser herunter...")
-        downloaded_pdfs = []  # Name kept for compatibility, but now handles all file types
-
-        # Create attachments directory next to output PDF
+    async def download_and_save(self, include_pdf_attachments=True):
+        """
+        Orchestrates the download process:
+        1. Launches browser
+        2. Extracts data
+        3. Downloads attachments (via browser)
+        4. Downloads images (via aiohttp parallel)
+        5. Generates PDF
+        Returns list of downloaded files for JSON export.
+        """
+        print(f"Start Taskcard download process for: {self.url}")
+        
+        # Prepare output directory
         output_path = Path(self.output_file)
         attachments_dir = output_path.parent / f"{output_path.stem}_attachments"
-        attachments_dir.mkdir(exist_ok=True)
-        print(f"Anhänge werden gespeichert in: {attachments_dir}\n")
-
+        if include_pdf_attachments:
+            attachments_dir.mkdir(exist_ok=True)
+            
+        downloaded_files = [] 
+        
         async with async_playwright() as p:
+            # Launch browser once
             browser = await p.chromium.launch(headless=True)
+            # Create context with accept_downloads=True from the start
             context = await browser.new_context(accept_downloads=True)
             page = await context.new_page()
-
+            
             try:
-                # Navigate to the page again
-                await page.goto(self.url, wait_until='networkidle', timeout=30000)
-                await page.wait_for_timeout(5000)
-
-                # Scroll to load all content
-                board_container = await page.query_selector('.board-container')
-                if board_container:
-                    scroll_width = await page.evaluate('() => document.querySelector(".board-container").scrollWidth')
-                    current = 0
-                    while current < scroll_width:
-                        await page.evaluate(f'() => {{ document.querySelector(".board-container").scrollLeft = {current} }}')
-                        await page.wait_for_timeout(500)
-                        current += 600
-
-                    await page.evaluate('() => { document.querySelector(".board-container").scrollLeft = 0 }')
-                    await page.wait_for_timeout(1000)
-
-                # Find all file attachment divs - try multiple selectors
-                # Type 1: Border cursor-pointer (most common)
-                border_attachments = await page.query_selector_all('[class*="border cursor-pointer"]')
-
-                # Type 2: Q-item clickable (all file types with icons)
-                qitem_attachments = await page.query_selector_all('.q-item--clickable:has(i[class*="mdi-file"])')
-
-                # Type 3: Direct file links
-                file_links = await page.query_selector_all('.board-card-content a[href*="download"]')
-
-                # Combine all unique attachments
-                all_attachments = list(border_attachments) + list(qitem_attachments) + list(file_links)
-                print(f"  Gefunden: {len(all_attachments)} potentielle Anhänge (Typen: {len(border_attachments)} standard, {len(qitem_attachments)} preview, {len(file_links)} links)")
-
-                for idx, att_div in enumerate(all_attachments):
-                    try:
-                        # Get attachment info - try different selectors
-                        caption_text = None
-
-                        # Try q-item format first (has filename in q-item__label)
-                        qitem_label = await att_div.query_selector('.q-item__label')
-                        if qitem_label:
-                            caption_text = await qitem_label.inner_text()
-                        else:
-                            # Try standard format
-                            caption = await att_div.query_selector('.text-caption')
-                            if caption:
-                                caption_text = await caption.inner_text()
-
-                        if caption_text:
-                            print(f"  [{idx+1}/{len(all_attachments)}] Lade: {caption_text[:60]}...")
-
-                            try:
-                                # Setup download promise before clicking
-                                async with page.expect_download(timeout=30000) as download_info:
-                                    # Click the attachment to trigger download
-                                    await att_div.click()
-
-                                download = await download_info.value
-
-                                # Get original filename from download
-                                suggested_filename = download.suggested_filename
-
-                                # Sanitize filename
-                                safe_filename = "".join(c for c in suggested_filename if c.isalnum() or c in (' ', '.', '_', '-')).strip()
-                                if not safe_filename:
-                                    safe_filename = f"attachment_{idx}.bin"
-
-                                # Save to attachments directory
-                                final_path = attachments_dir / safe_filename
-
-                                # Handle duplicate filenames
-                                counter = 1
-                                while final_path.exists():
-                                    name, ext = os.path.splitext(safe_filename)
-                                    final_path = attachments_dir / f"{name}_{counter}{ext}"
-                                    counter += 1
-
-                                await download.save_as(str(final_path))
-
-                                file_size = os.path.getsize(final_path)
-                                downloaded_pdfs.append({
-                                    'info': caption_text,
-                                    'file_path': str(final_path)
-                                })
-                                print(f"      ✓ {file_size // 1024} KB heruntergeladen → {final_path.name}")
-
-                                # Wait a bit before next download
-                                await page.wait_for_timeout(500)
-
-                            except Exception as download_error:
-                                print(f"      ⚠️  Download-Fehler: {str(download_error)[:80]}")
-
-                    except Exception as e:
-                        print(f"      ⚠️  Fehler: {str(e)[:80]}")
-
-                print(f"\n  {len(downloaded_pdfs)} Anhänge erfolgreich heruntergeladen")
-
-                # Download images from cards
-                total_images = sum(len(card.get('images', [])) for col in self.data.get('columns', []) for card in col.get('cards', []))
-                print(f"\nLade Bilder aus Karten herunter...")
-                print(f"  Gefunden: {total_images} Bilder")
-                image_count = 0
-                for column in self.data.get('columns', []):
-                    for card in column.get('cards', []):
-                        for image in card.get('images', []):
-                            try:
-                                src = image.get('src')
-                                alt = image.get('alt', 'Bild')
-
-                                if not src:
-                                    continue
-
-                                print(f"  Lade Bild: {alt[:50]}...")
-
-                                # Download image using requests
-                                import requests
-                                response = requests.get(src, timeout=30)
-                                response.raise_for_status()
-
-                                # Determine file extension from content-type or URL
-                                content_type = response.headers.get('content-type', '')
-                                if 'png' in content_type:
-                                    ext = '.png'
-                                elif 'jpeg' in content_type or 'jpg' in content_type:
-                                    ext = '.jpg'
-                                elif 'gif' in content_type:
-                                    ext = '.gif'
-                                elif 'webp' in content_type:
-                                    ext = '.webp'
-                                else:
-                                    # Try to guess from URL
-                                    if src.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                                        ext = src[src.rfind('.'):]
-                                    else:
-                                        ext = '.jpg'  # Default
-
-                                # Sanitize filename
-                                safe_name = "".join(c for c in alt if c.isalnum() or c in (' ', '.', '_', '-')).strip()
-                                if not safe_name:
-                                    safe_name = f"image_{image_count}"
-
-                                # Save image
-                                final_path = attachments_dir / f"{safe_name}{ext}"
-
-                                # Handle duplicates
-                                counter = 1
-                                while final_path.exists():
-                                    final_path = attachments_dir / f"{safe_name}_{counter}{ext}"
-                                    counter += 1
-
-                                with open(final_path, 'wb') as f:
-                                    f.write(response.content)
-
-                                # Add to downloaded_pdfs list with image info
-                                downloaded_pdfs.append({
-                                    'info': f"Bild: {alt}",
-                                    'file_path': str(final_path),
-                                    'type': 'image'
-                                })
-
-                                # Update image reference in card data
-                                image['local_path'] = str(final_path)
-
-                                image_count += 1
-                                print(f"      ✓ {len(response.content) // 1024} KB → {final_path.name}")
-
-                            except Exception as e:
-                                print(f"      ⚠️  Fehler beim Laden des Bildes: {str(e)[:60]}")
-
-                if image_count > 0:
-                    print(f"\n  {image_count} Bilder erfolgreich heruntergeladen")
-
-            except Exception as e:
-                print(f"Fehler beim Herunterladen der Anhänge: {e}")
+                # 1. Load and Extract Data
+                await self._load_and_extract_data(page)
+                
+                # 2. Download Attachments (files that need clicking)
+                if include_pdf_attachments:
+                    att_files = await self._download_clickable_attachments(page, attachments_dir)
+                    downloaded_files.extend(att_files)
+                    
             finally:
                 await browser.close()
+        
+        # 3. Download Images (Parallel) - outside of browser context as we just need URLs
+        if include_pdf_attachments and self.data.get('columns'):
+            image_files = await self._download_images_parallel(attachments_dir)
+            downloaded_files.extend(image_files)
+            
+        # 4. Generate PDF
+        self.generate_pdf(downloaded_files)
+        
+        return downloaded_files
 
-        return downloaded_pdfs
+    async def _load_and_extract_data(self, page):
+        """Loads page and extracts data using the provided page object"""
+        print(f"Öffne Taskcard: {self.url}")
+        
+        # Navigate to the page
+        await page.goto(self.url, wait_until='networkidle', timeout=30000)
+
+        # Wait for content to load
+        print("Warte auf Seiteninhalt...")
+        await page.wait_for_timeout(5000)
+
+        # Scroll logic to trigger lazy loading
+        await self._scroll_page(page)
+
+        # Save screenshot
+        debug_screenshot = Path(self.output_file).parent / 'taskcard_debug.png'
+        try:
+             await page.screenshot(path=str(debug_screenshot), full_page=True)
+             print(f"Screenshot gespeichert: {debug_screenshot}")
+        except Exception as e:
+            print(f"Screenshot Fehler: {e}")
+
+        # Extract data implementation
+        await self._extract_data_js(page, debug_screenshot)
+        
+    async def _scroll_page(self, page):
+        """Handles the scrolling logic"""
+        print("Lade alle Spalten durch Scrollen...")
+        board_container = await page.query_selector('.board-container')
+        if board_container:
+            # Get the scrollable width
+            scroll_width = await page.evaluate('''
+                () => {
+                    const container = document.querySelector('.board-container');
+                    return container ? container.scrollWidth : 0;
+                }
+            ''')
+
+            # Scroll in steps
+            current_scroll = 0
+            step = 600
+            while current_scroll < scroll_width:
+                await page.evaluate(f'''
+                    () => {{
+                        const container = document.querySelector('.board-container');
+                        if (container) {{
+                            container.scrollLeft = {current_scroll};
+                        }}
+                    }}
+                ''')
+                await page.wait_for_timeout(500)
+                current_scroll += step
+
+            # Scroll to end and back
+            await page.evaluate('''
+                () => {
+                    const container = document.querySelector('.board-container');
+                    if (container) container.scrollLeft = container.scrollWidth;
+                }
+            ''')
+            await page.wait_for_timeout(1000)
+            
+            await page.evaluate('''
+                () => {
+                    const container = document.querySelector('.board-container');
+                    if (container) container.scrollLeft = 0;
+                }
+            ''')
+            await page.wait_for_timeout(1000)
+            
+    async def _extract_data_js(self, page, debug_screenshot):
+        """Runs the JS extraction logic"""
+        # (This contains the large JS block from the original code)
+        debug_info = await page.evaluate("""
+            () => {
+                const columns = document.querySelectorAll('.draggableList');
+                return columns.length;
+            }
+        """)
+        print(f"DEBUG: Gefundene Spalten-Container: {debug_info}")
+
+        # Extract data using JavaScript
+        data = await page.evaluate("""
+            () => {
+                const result = {
+                    board_title: '',
+                    columns: [],
+                    extraction_strategy: '',
+                    debug_info: ''
+                };
+
+                // Extract board title with fallbacks
+                const titleContainer = document.querySelector('.board-information-title');
+                if (titleContainer) {
+                    result.board_title = titleContainer.innerText.trim();
+                } else {
+                    const headerTitle = document.querySelector('h1, .board-header-container .text-h5');
+                    if (headerTitle) {
+                        result.board_title = headerTitle.innerText.trim();
+                    } else {
+                        result.board_title = document.title || 'Unbenanntes Board';
+                    }
+                }
+
+                // Helper function to extract card data
+                const extractCardData = (cardEl) => {
+                    const card = {
+                        title: '',
+                        description: '',
+                        links: [],
+                        attachments: [],
+                        images: []
+                    };
+
+                    // Get card title from board-card-header
+                    const cardHeader = cardEl.querySelector('.board-card-header .contenteditable');
+                    if (cardHeader) {
+                        card.title = cardHeader.innerText.trim();
+                    }
+
+                    // Get card content from board-card-content
+                    const cardContent = cardEl.querySelector('.board-card-content');
+                    if (cardContent) {
+                        // Get text content (first contenteditable in card content)
+                        const contentText = cardContent.querySelector('.contenteditable');
+                        if (contentText) {
+                            card.description = contentText.innerText.trim();
+                        }
+
+                        // Get links
+                        const links = cardContent.querySelectorAll('a[href]');
+                        for (const link of links) {
+                            const href = link.href;
+                            const text = link.innerText.trim() || link.href;
+                            if (!card.links.find(l => l.url === href)) {
+                                card.links.push({ text, url: href });
+                            }
+                        }
+
+                        // Get images from card - normal <img> tags
+                        const images = cardContent.querySelectorAll('img');
+                        for (const img of images) {
+                            const src = img.src;
+                            const alt = img.alt || 'Bild';
+                            if (src && src.startsWith('http')) {
+                                card.images.push({ src, alt });
+                            }
+                        }
+
+                        // Get background images (Taskcard Preview Style)
+                        const bgImages = cardContent.querySelectorAll('.q-img__image');
+                        for (const div of bgImages) {
+                            const bgStyle = div.style.backgroundImage;
+                            if (bgStyle) {
+                                const urlMatch = bgStyle.match(/url\\("?(.+?)"?\\)/);
+                                if (urlMatch) {
+                                    card.images.push({
+                                        src: urlMatch[1],
+                                        alt: 'Hintergrundbild'
+                                    });
+                                }
+                            }
+                        }
+
+                        // Get attachment info (PDFs, files) with download URLs
+                        const attachmentDivs = cardContent.querySelectorAll('[class*="border cursor-pointer"]');
+                        for (const attDiv of attachmentDivs) {
+                            const fileInfo = attDiv.querySelector('.text-caption');
+                            // Get the background image URL which contains the file URL
+                            const imgDiv = attDiv.querySelector('.q-img__image');
+                            let fileUrl = null;
+                            if (imgDiv) {
+                                const bgStyle = imgDiv.style.backgroundImage;
+                                if (bgStyle) {
+                                    const urlMatch = bgStyle.match(/url\\("(.+?)"\\)/);
+                                    if (urlMatch) {
+                                        fileUrl = urlMatch[1];
+                                    }
+                                }
+                            }
+
+                            if (fileInfo) {
+                                const text = fileInfo.innerText.trim();
+                                card.attachments.push({
+                                    info: text,
+                                    url: fileUrl
+                                });
+                            }
+                        }
+                    }
+
+                    return card;
+                };
+
+                // STRATEGY 1: Column Layout (Kanban)
+                const columns = document.querySelectorAll('.draggableList');
+
+                if (columns.length > 0) {
+                    result.extraction_strategy = 'Spalten-Layout (Kanban)';
+                    result.debug_info = `${columns.length} Spalte(n) erkannt`;
+
+                    for (const col of columns) {
+                        const columnData = {
+                            title: '',
+                            cards: []
+                        };
+
+                        const colHeaderDiv = col.querySelector('.board-list-header .contenteditable');
+                        if (colHeaderDiv) {
+                            columnData.title = colHeaderDiv.innerText.trim();
+                        }
+
+                        const cardElements = col.querySelectorAll('.board-card');
+                        for (const cardEl of cardElements) {
+                            const card = extractCardData(cardEl);
+                            if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
+                                columnData.cards.push(card);
+                            }
+                        }
+
+                        if (columnData.title || columnData.cards.length > 0) {
+                            result.columns.push(columnData);
+                        }
+                    }
+
+                // STRATEGY 2: Free Layout (Pinboard/Timeline)
+                } else {
+                    const allCards = document.querySelectorAll('.board-card');
+
+                    if (allCards.length > 0) {
+                        result.extraction_strategy = 'Freies Layout (Pinnwand/Tafel)';
+                        result.debug_info = `${allCards.length} Karte(n) ohne Spalten gefunden`;
+
+                        const fallbackColumn = {
+                            title: 'Alle Inhalte (Freies Layout)',
+                            cards: []
+                        };
+
+                        for (const cardEl of allCards) {
+                            const card = extractCardData(cardEl);
+                            if (card.title || card.description || card.links.length > 0 || card.attachments.length > 0 || card.images.length > 0) {
+                                fallbackColumn.cards.push(card);
+                            }
+                        }
+                        result.columns.push(fallbackColumn);
+                    } else {
+                         result.extraction_strategy = 'FEHLER: Keine Inhalte erkannt';
+                    }
+                }
+                return result;
+            }
+        """)
+
+        self.data = data
+        self._print_extraction_summary(debug_screenshot)
+
+    def _print_extraction_summary(self, debug_screenshot):
+        """Prints summary of extracted data"""
+        strategy = self.data.get('extraction_strategy', 'Unbekannt')
+        debug_info = self.data.get('debug_info', '')
+
+        print(f"\n{'='*60}")
+        print(f"📋 EXTRAKTIONS-STRATEGIE: {strategy}")
+        print(f"ℹ️  {debug_info}")
+        print(f"{'='*60}")
+
+        print(f"\nBoard-Titel: {self.data['board_title']}")
+        print(f"Gefundene Spalten: {len(self.data['columns'])}")
+
+        for idx, col in enumerate(self.data['columns']):
+            total_images = sum(len(card.get('images', [])) for card in col['cards'])
+            print(f"  Spalte {idx+1}: {col['title']} ({len(col['cards'])} Karten, {total_images} Bilder)")
+
+        if self.data.get('extraction_strategy', '').startswith('FEHLER'):
+            print("\n⚠️  WARNUNG: Keine Inhalte gefunden!")
+            print(f"    Debug-Screenshot: {debug_screenshot}")
+
+    async def _download_clickable_attachments(self, page, attachments_dir):
+        """Downloads file attachments by clicking them in the browser"""
+        print("\nLade klickbare Anhänge über Browser herunter...")
+        downloaded_files = [] 
+        
+        # Find clickable attachments
+        border_attachments = await page.query_selector_all('[class*="border cursor-pointer"]')
+        qitem_attachments = await page.query_selector_all('.q-item--clickable:has(i[class*="mdi-file"])')
+        file_links = await page.query_selector_all('.board-card-content a[href*="download"]')
+        
+        all_attachments = list(border_attachments) + list(qitem_attachments) + list(file_links)
+        print(f"  Gefunden: {len(all_attachments)} potentielle Anhänge")
+
+        for idx, att_div in enumerate(all_attachments):
+            try:
+                caption_text = None
+                # Try finding text
+                qitem_label = await att_div.query_selector('.q-item__label')
+                if qitem_label:
+                    caption_text = await qitem_label.inner_text()
+                else:
+                    caption = await att_div.query_selector('.text-caption')
+                    if caption:
+                        caption_text = await caption.inner_text()
+                
+                if not caption_text:
+                    caption_text = f"Anhang {idx+1}"
+
+                print(f"  [{idx+1}/{len(all_attachments)}] Lade: {caption_text[:60]}...")
+
+                try:
+                    async with page.expect_download(timeout=10000) as download_info:
+                        await att_div.click()
+                    
+                    download = await download_info.value
+                    suggested_filename = download.suggested_filename
+                    safe_filename = "".join(c for c in suggested_filename if c.isalnum() or c in (' ', '.', '_', '-')).strip() or f"attachment_{idx}.bin"
+                    
+                    final_path = attachments_dir / safe_filename
+                    counter = 1
+                    while final_path.exists():
+                        name, ext = os.path.splitext(safe_filename)
+                        final_path = attachments_dir / f"{name}_{counter}{ext}"
+                        counter += 1
+                        
+                    await download.save_as(str(final_path))
+                    
+                    downloaded_files.append({
+                        'info': caption_text,
+                        'file_path': str(final_path),
+                        'type': 'file'
+                    })
+                    print(f"      ✓ Gespeichert: {final_path.name}")
+                    
+                except Exception as down_err:
+                    print(f"      ⚠️  Kein Download ausgelöst oder Timeout (kein File?): {str(down_err)[:50]}")
+                    
+            except Exception as e:
+                print(f"      ⚠️  Fehler bei Anhang {idx}: {e}")
+                
+        return downloaded_files
+
+    async def _download_images_parallel(self, attachments_dir):
+        """Downloads all images in parallel using aiohttp"""
+        all_images = []
+        for col in self.data.get('columns', []):
+            for card in col.get('cards', []):
+                for image in card.get('images', []):
+                    if image.get('src'):
+                        all_images.append(image)
+        
+        if not all_images:
+            return []
+            
+        print(f"\nLade {len(all_images)} Bilder parallel herunter...")
+        
+        downloaded_images = []
+        semaphore = asyncio.Semaphore(10)  # Limit concurrency
+        
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for idx, img in enumerate(all_images):
+                tasks.append(self._download_single_image(session, img, attachments_dir, idx, semaphore))
+                
+            results = await asyncio.gather(*tasks)
+            
+            # Filter None results
+            for res in results:
+                if res:
+                    downloaded_images.append(res)
+                    
+        print(f"  {len(downloaded_images)}/{len(all_images)} Bilder erfolgreich geladen.")
+        return downloaded_images
+
+    async def _download_single_image(self, session, image_data, attachments_dir, idx, semaphore):
+        """Helper to download a single image"""
+        src = image_data.get('src')
+        alt = image_data.get('alt', 'Bild')
+        
+        async with semaphore:
+            try:
+                async with session.get(src, timeout=30) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        
+                        # Guess extension
+                        content_type = response.headers.get('content-type', '')
+                        if 'png' in content_type: ext = '.png'
+                        elif 'jpeg' in content_type or 'jpg' in content_type: ext = '.jpg'
+                        elif 'gif' in content_type: ext = '.gif'
+                        elif 'webp' in content_type: ext = '.webp'
+                        else: ext = '.jpg'
+                        
+                        # Filename
+                        safe_name = "".join(c for c in alt if c.isalnum() or c in (' ', '.', '_', '-')).strip()
+                        if not safe_name: safe_name = f"image_{idx}"
+                        
+                        # Save
+                        final_path = attachments_dir / f"{safe_name}{ext}"
+                        counter = 1
+                        while final_path.exists():
+                            final_path = attachments_dir / f"{safe_name}_{counter}{ext}"
+                            counter += 1
+                            
+                        with open(final_path, 'wb') as f:
+                            f.write(content)
+                            
+                        # Update local path in data
+                        image_data['local_path'] = str(final_path)
+                        
+                        print(f"  ✓ Bild geladen: {final_path.name}")
+                        return {
+                            'info': f"Bild: {alt}",
+                            'file_path': str(final_path),
+                            'type': 'image'
+                        }
+            except Exception as e:
+                print(f"  ⚠️  Fehler bei Bild {alt[:20]}: {e}")
+                return None
+
+    # Keeping old method name for compatibility if needed, but it should be unused
+    async def fetch_taskcard_data(self): 
+
+
+        return await self.download_and_save()
+    
+
+
 
     def generate_pdf(self, downloaded_pdfs=None):
         """Generates structured PDF with TOC, columns as chapters, cards as subchapters, attachments inline"""
@@ -881,39 +826,7 @@ class TaskcardDownloader:
             print(f"❌ Fehler beim Zusammenfügen: {e}")
             raise
 
-    def _merge_pdfs(self, overview_pdf_path, downloaded_pdfs):
-        """Merges overview PDF with downloaded PDF attachments"""
-        try:
-            pdf_writer = PdfWriter()
 
-            # Add overview PDF
-            with open(overview_pdf_path, 'rb') as f:
-                pdf_reader = PdfReader(f)
-                for page in pdf_reader.pages:
-                    pdf_writer.add_page(page)
-
-            # Add each downloaded PDF
-            for pdf_info in downloaded_pdfs:
-                try:
-                    print(f"  Füge hinzu: {pdf_info['info'][:60]}...")
-                    with open(pdf_info['file_path'], 'rb') as f:
-                        pdf_reader = PdfReader(f)
-                        # Add separator page info (optional - could add a title page here)
-                        for page in pdf_reader.pages:
-                            pdf_writer.add_page(page)
-
-                    # Clean up temp file
-                    os.unlink(pdf_info['file_path'])
-                except Exception as e:
-                    print(f"    ⚠️  Fehler beim Hinzufügen: {e}")
-
-            # Write final merged PDF
-            with open(self.output_file, 'wb') as output_file:
-                pdf_writer.write(output_file)
-
-        except Exception as e:
-            print(f"❌ Fehler beim Zusammenführen der PDFs: {e}")
-            raise
 
     @staticmethod
     def _escape_html(text):
@@ -926,26 +839,8 @@ class TaskcardDownloader:
         text = text.replace('>', '&gt;')
         return text
 
-    async def download_and_save(self, include_pdf_attachments=True):
-        """Main method to download and save as PDF"""
-        # Check if browsers are installed
-        if not check_playwright_browsers():
-            raise RuntimeError("Playwright-Browser sind nicht installiert. Bitte folgen Sie den obigen Anweisungen.")
 
-        # Only fetch data if not already fetched
-        if not self.data.get('board_title') or not self.data.get('columns'):
-            await self.fetch_taskcard_data()
 
-        # Download PDF attachments if requested
-        downloaded_pdfs = []
-        if include_pdf_attachments:
-            downloaded_pdfs = await self.download_pdf_attachments_with_playwright()
-
-        # Generate final PDF
-        self.generate_pdf(downloaded_pdfs)
-
-        # Return downloaded PDFs for JSON export
-        return downloaded_pdfs
 
     def export_json(self, json_file=None, downloaded_pdfs=None):
         """Export Taskcard data as JSON

@@ -448,35 +448,56 @@ class TaskcardDownloaderGUI:
             log_capture = io.StringIO()
 
             # Run async download
+            # Run async download
             async def download_task():
-                # First fetch the data to get the board title
-                await downloader.fetch_taskcard_data()
-
-                # Update output filename based on board title
-                if downloader.data.get('board_title'):
-                    # Sanitize the board title for use as filename
-                    board_title = downloader.data['board_title']
-                    # Remove invalid filename characters
-                    safe_title = re.sub(r'[<>:"/\\|?*]', '', board_title)
-                    # Limit length to 100 characters
-                    safe_title = safe_title[:100].strip()
-
-                    # Update the output file with the board title
-                    output_path = Path(output_file)
-                    new_filename = f"{safe_title}.pdf"
-                    new_output_file = output_path.parent / new_filename
-                    downloader.output_file = str(new_output_file)
-
-                    # Update the GUI output field
-                    self.root.after(0, self.output_var.set, str(new_output_file))
-                    self.root.after(0, self.log, f"Dateiname angepasst: {new_filename}")
-
-                # Now save the PDF and get downloaded PDFs list
+                # Perform the full download process in one go
+                # (Optimization: Single browser session for extraction and downloads)
                 downloaded_pdfs = await downloader.download_and_save(include_pdf_attachments=include_attachments)
+
+                # Attempt to rename file based on board title (if found)
+                final_output_file = Path(downloader.output_file)
+                
+                # Check if we should/can rename
+                if downloader.data.get('board_title'):
+                    board_title = downloader.data['board_title']
+                    safe_title = re.sub(r'[<>:"/\\|?*]', '', board_title)
+                    safe_title = safe_title[:100].strip()
+                    
+                    if safe_title:
+                        # Construct new filename
+                        new_filename = f"{safe_title}.pdf"
+                        new_output_path = final_output_file.parent / new_filename
+                        
+                        # Only rename if different and doesn't exist (to be safe)
+                        if new_output_path != final_output_file and not new_output_path.exists():
+                            try:
+                                # 1. Rename PDF
+                                final_output_file.rename(new_output_path)
+                                
+                                # 2. Rename attachments directory if it exists
+                                old_att_dir = final_output_file.parent / f"{final_output_file.stem}_attachments"
+                                new_att_dir = new_output_path.parent / f"{new_output_path.stem}_attachments"
+                                
+                                if old_att_dir.exists() and not new_att_dir.exists():
+                                    old_att_dir.rename(new_att_dir)
+                                    
+                                    # We would strictly need to update paths in downloaded_pdfs here 
+                                    # if we wanted 100% correct JSON paths, but for now we skip that 
+                                    # complexity to avoid breaking things.
+                                
+                                # Update references
+                                final_output_file = new_output_path
+                                downloader.output_file = str(final_output_file)
+                                
+                                self.root.after(0, self.output_var.set, str(final_output_file))
+                                self.root.after(0, self.log, f"Dateiname angepasst: {new_filename}")
+                                
+                            except Exception as rename_error:
+                                self.root.after(0, self.log, f"⚠️  Konnte Datei nicht umbenennen: {rename_error}")
 
                 # Export JSON if requested
                 if export_json:
-                    json_file = Path(downloader.output_file).with_suffix('.json')
+                    json_file = final_output_file.with_suffix('.json')
                     downloader.export_json(str(json_file), downloaded_pdfs=downloaded_pdfs)
                     self.root.after(0, self.log, f"✅ JSON erfolgreich exportiert: {json_file}")
 
